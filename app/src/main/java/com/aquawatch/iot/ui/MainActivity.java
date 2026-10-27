@@ -12,6 +12,7 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Looper;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.widget.EditText;
@@ -351,7 +352,7 @@ public class MainActivity extends AppCompatActivity implements BluetoothClassicM
 
     // Small helpers avoid leaking UI access from Bluetooth/service worker threads.
     private static final class LooperCompat {
-        static boolean isMainThread() { return android.os.Looper.myLooper() == android.os.Looper.getMainLooper(); }
+        static boolean isMainThread() { return Looper.myLooper() == Looper.getMainLooper(); }
     }
 
     private static final class StringWriterSupport {
