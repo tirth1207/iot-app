@@ -1,5 +1,6 @@
 package com.aquawatch.iot.service;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -8,16 +9,16 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.ServiceInfo;
 import android.content.pm.PackageManager;
-import android.Manifest;
-import android.os.Handler;
-import android.os.Looper;
-import androidx.core.content.ContextCompat;
+import android.content.pm.ServiceInfo;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
+import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
+import androidx.core.content.ContextCompat;
 
 import com.aquawatch.iot.AquaWatchApp;
 import com.aquawatch.iot.R;
@@ -30,16 +31,18 @@ import com.aquawatch.iot.network.ThingSpeakApiClient;
 import com.aquawatch.iot.notification.AlertNotificationManager;
 import com.aquawatch.iot.ui.MainActivity;
 
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class AquaWatchForegroundService extends Service implements BluetoothClassicManager.BluetoothEventListener {
-
     public static final String ACTION_START = "ACTION_START";
     public static final String ACTION_STOP = "ACTION_STOP";
     public static final String EXTRA_MAC = "EXTRA_MAC";
     public static final String CHANNEL_ID = "aquawatch_service_channel";
     private static final int NOTIF_ID = 1001;
+    private static final String TAG = "AquaWatchService";
 
     private AquaWatchApp app;
     private BluetoothClassicManager btManager;
@@ -77,21 +80,35 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
     @Override
     public void onCreate() {
         super.onCreate();
-        app = (AquaWatchApp) getApplication();
-        btManager = app.getBluetoothManager();
-        btManager.addListener(this);
-        alertManager = new AlertNotificationManager(this);
-        createServiceChannel();
+        logBreadcrumb("SERVICE: created");
+        try {
+            app = (AquaWatchApp) getApplication();
+            btManager = app.getBluetoothManager();
+            // Register before connect() can be called so CONNECTING is never missed.
+            btManager.addListener(this);
+            alertManager = new AlertNotificationManager(this);
+            createServiceChannel();
+        } catch (Throwable t) {
+            reportError("SERVICE onCreate failed", t);
+            stopSelf();
+        }
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && ACTION_START.equals(intent.getAction())) {
-            String mac = intent.getStringExtra(EXTRA_MAC);
-            currentMac = mac;
-            reconnectAttempts = 0;
-            userStopped = false;
-            if (mac != null && !mac.isEmpty()) {
+        String action = intent == null ? "null" : String.valueOf(intent.getAction());
+        String mac = intent == null ? null : intent.getStringExtra(EXTRA_MAC);
+        logBreadcrumb("SERVICE: onStartCommand action=" + action + " mac=" + mac);
+        try {
+            if (intent != null && ACTION_START.equals(intent.getAction())) {
+                currentMac = mac;
+                reconnectAttempts = 0;
+                userStopped = false;
+                if (mac == null || mac.trim().isEmpty()) {
+                    broadcastState("ERROR", "Invalid or missing Bluetooth MAC address.");
+                    stopSelf();
+                    return START_NOT_STICKY;
+                }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                         && ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
                     broadcastState("ERROR", "PERMISSION_DENIED: grant Nearby devices permission before starting monitoring.");
@@ -100,19 +117,32 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
                 }
                 try {
                     startInForeground("Connecting to Arduino Bluetooth...");
-                    btManager.connect(mac);
-                } catch (SecurityException e) {
-                    broadcastState("ERROR", "PERMISSION_DENIED: could not start connected-device foreground service: " + e.getMessage());
+                } catch (IllegalStateException e) {
+                    reportError("Foreground start rejected by Android", e);
                     stopSelf();
+                    return START_NOT_STICKY;
+                } catch (SecurityException e) {
+                    reportError("Foreground start permission failure", e);
+                    stopSelf();
+                    return START_NOT_STICKY;
                 }
+                logBreadcrumb("SERVICE: immediately before btManager.connect()");
+                btManager.connect(mac);
+                logBreadcrumb("SERVICE: immediately after btManager.connect()");
+            } else if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+                userStopped = true;
+                reconnectScheduled = false;
+                mainHandler.removeCallbacksAndMessages(null);
+                if (btManager != null) btManager.disconnect();
+                stopForeground(STOP_FOREGROUND_REMOVE);
+                stopSelf();
+            } else {
+                logBreadcrumb("SERVICE: no start/stop action; no connection initiated");
             }
-        } else if (intent != null && ACTION_STOP.equals(intent.getAction())) {
-            userStopped = true;
-            reconnectScheduled = false;
-            mainHandler.removeCallbacksAndMessages(null);
-            btManager.disconnect();
-            stopForeground(STOP_FOREGROUND_REMOVE);
+        } catch (Throwable t) {
+            reportError("SERVICE onStartCommand failed", t);
             stopSelf();
+            return START_NOT_STICKY;
         }
         return START_NOT_STICKY;
     }
@@ -120,7 +150,6 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
     private void startInForeground(String text) {
         Intent intent = new Intent(this, MainActivity.class);
         PendingIntent pi = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE);
-
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("AquaWatch Continuous Monitoring")
                 .setContentText(text)
@@ -128,17 +157,32 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
                 .setContentIntent(pi)
                 .setOngoing(true)
                 .build();
-
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
             } else {
                 startForeground(NOTIF_ID, notification);
             }
-        } catch (SecurityException e) {
-            broadcastState("ERROR", "PERMISSION_DENIED: foreground service could not start. Grant Nearby devices permission first. " + e.getMessage());
-            throw e;
+            logBreadcrumb("SERVICE: foreground started");
+        } catch (Throwable t) {
+            // API 31+ foreground-start restrictions are IllegalStateException subclasses.
+            reportError("startForeground failed", t);
+            throw t;
         }
+    }
+
+    private void reportError(String context, Throwable throwable) {
+        Log.e(TAG, context, throwable);
+        StringWriter sw = new StringWriter();
+        throwable.printStackTrace(new PrintWriter(sw));
+        String trace = sw.toString();
+        logBreadcrumb("ERROR: " + context + ": " + throwable + "\n" + trace);
+        broadcastState("ERROR", context + ": " + throwable + "\n" + trace);
+    }
+
+    private void logBreadcrumb(String message) {
+        AquaWatchApp.recordBreadcrumb(getApplicationContext(), message);
+        Log.d(TAG, message);
     }
 
     private void updateNotification(String text) {
@@ -149,38 +193,42 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
                 .setOngoing(true)
                 .build();
         NotificationManager nm = getSystemService(NotificationManager.class);
-        if (nm != null) {
-            nm.notify(NOTIF_ID, notification);
-        }
+        if (nm != null) nm.notify(NOTIF_ID, notification);
     }
 
     @Override
     public void onConnectionStateChanged(String state, String details) {
         mainHandler.post(() -> {
-            updateNotification(state + ": " + details);
-            broadcastState(state, details);
-            if ("CONNECTED".equals(state)) {
-                reconnectAttempts = 0;
-                reconnectScheduled = false;
-            } else if ("DISCONNECTED".equals(state) && !userStopped && currentMac != null
-                    && reconnectAttempts < MAX_AUTO_RECONNECTS && !reconnectScheduled) {
-                reconnectAttempts++;
-                reconnectScheduled = true;
-                long delay = 1000L * reconnectAttempts;
-                broadcastState("RECONNECTING", "Connection dropped; retry " + reconnectAttempts + " of " + MAX_AUTO_RECONNECTS + " in " + delay + " ms.");
-                mainHandler.postDelayed(() -> {
+            try {
+                updateNotification(state + ": " + details);
+                broadcastState(state, details);
+                if ("CONNECTED".equals(state)) {
+                    reconnectAttempts = 0;
                     reconnectScheduled = false;
-                    if (!userStopped && currentMac != null) btManager.connect(currentMac);
-                }, delay);
+                } else if ("DISCONNECTED".equals(state) && !userStopped && currentMac != null
+                        && reconnectAttempts < MAX_AUTO_RECONNECTS && !reconnectScheduled) {
+                    reconnectAttempts++;
+                    reconnectScheduled = true;
+                    long delay = 1000L * reconnectAttempts;
+                    broadcastState("RECONNECTING", "Connection dropped; retry " + reconnectAttempts + " of " + MAX_AUTO_RECONNECTS + " in " + delay + " ms.");
+                    mainHandler.postDelayed(() -> {
+                        reconnectScheduled = false;
+                        if (!userStopped && currentMac != null) btManager.connect(currentMac);
+                    }, delay);
+                }
+            } catch (Throwable t) {
+                reportError("Handling Bluetooth state " + state + " failed", t);
             }
         });
     }
 
     private void broadcastState(String state, String details) {
         Intent broadcast = new Intent("com.aquawatch.STATE_UPDATE");
+        broadcast.setPackage(getPackageName());
         broadcast.putExtra("state", state);
         broadcast.putExtra("details", details);
         sendBroadcast(broadcast);
+        logBreadcrumb("STATE: " + state + ": " + details);
     }
 
     @Override
@@ -194,43 +242,36 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
         if (record instanceof ParsedRecord.Telemetry) {
             ParsedRecord.Telemetry t = (ParsedRecord.Telemetry) record;
             ThresholdEvaluator.Result eval = evaluator.evaluate(t.levelPercent, t.distanceCm, lowThresh, highThresh, false);
-
-            if (eval.triggerAlert) {
-                alertManager.postAlert(eval.alertTitle, eval.alertMessage);
-            }
+            if (eval.triggerAlert) alertManager.postAlert(eval.alertTitle, eval.alertMessage);
 
             dbExecutor.execute(() -> {
                 app.getDatabase().dao().insertReading(new ReadingEntity(now, t.levelPercent, t.distanceCm, eval.status.code));
                 if (now - lastUploadTime >= MIN_UPLOAD_INTERVAL_MS && !apiKey.isEmpty()) {
                     ThingSpeakApiClient.Result upResult = apiClient.uploadReading(apiKey, t.levelPercent, t.distanceCm, eval.status.code, now / 1000L);
-                    if (upResult.success) {
-                        lastUploadTime = now;
-                    } else {
-                        app.getDatabase().dao().enqueueSync(new SyncQueueEntity(now, t.levelPercent, t.distanceCm, eval.status.code));
-                    }
+                    if (upResult.success) lastUploadTime = now;
+                    else app.getDatabase().dao().enqueueSync(new SyncQueueEntity(now, t.levelPercent, t.distanceCm, eval.status.code));
                 } else {
                     app.getDatabase().dao().enqueueSync(new SyncQueueEntity(now, t.levelPercent, t.distanceCm, eval.status.code));
                 }
             });
 
             Intent broadcast = new Intent("com.aquawatch.TELEMETRY_UPDATE");
+            broadcast.setPackage(getPackageName());
             broadcast.putExtra("level", t.levelPercent);
             broadcast.putExtra("distance", t.distanceCm);
             broadcast.putExtra("statusCode", eval.status.code);
             broadcast.putExtra("statusLabel", eval.status.label);
             sendBroadcast(broadcast);
-
         } else if (record instanceof ParsedRecord.HardwareError) {
             ThresholdEvaluator.Result eval = evaluator.evaluate(0f, 0f, lowThresh, highThresh, true);
-            if (eval.triggerAlert) {
-                alertManager.postAlert(eval.alertTitle, eval.alertMessage);
-            }
+            if (eval.triggerAlert) alertManager.postAlert(eval.alertTitle, eval.alertMessage);
         }
     }
 
     @Override
     public void onRawMessage(String raw) {
         Intent broadcast = new Intent("com.aquawatch.RAW_MSG");
+        broadcast.setPackage(getPackageName());
         broadcast.putExtra("raw", raw);
         sendBroadcast(broadcast);
     }
@@ -238,14 +279,9 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
     private void createServiceChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID,
-                    "AquaWatch Active Link",
-                    NotificationManager.IMPORTANCE_LOW
-            );
+                    CHANNEL_ID, "AquaWatch Active Link", NotificationManager.IMPORTANCE_LOW);
             NotificationManager nm = getSystemService(NotificationManager.class);
-            if (nm != null) {
-                nm.createNotificationChannel(channel);
-            }
+            if (nm != null) nm.createNotificationChannel(channel);
         }
     }
 
@@ -259,7 +295,5 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
     }
 
     @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
+    public IBinder onBind(Intent intent) { return null; }
 }
