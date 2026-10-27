@@ -7,6 +7,8 @@ import android.bluetooth.BluetoothSocket;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -89,21 +91,7 @@ public class BluetoothClassicManager {
                 BluetoothSocket socket = null;
                 try {
                     bluetoothAdapter.cancelDiscovery();
-
-                    // Try the normal authenticated SPP connection first.
-                    try {
-                        socket = device.createRfcommSocketToServiceRecord(SPP_UUID);
-                        socket.connect();
-                    } catch (IOException secureError) {
-                        closeQuietly(socket);
-                        socket = null;
-                        if (!isRunning.get()) return;
-
-                        // Some HC-05 firmware/configurations work only with insecure RFCOMM.
-                        notifyState("CONNECTING", "Secure connection failed; trying HC-05 compatibility mode.");
-                        socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID);
-                        socket.connect();
-                    }
+                    socket = connectWithFallbacks(device);
 
                     if (!isRunning.get()) {
                         closeQuietly(socket);
@@ -142,6 +130,71 @@ public class BluetoothClassicManager {
                 }
             }
         });
+    }
+
+    @SuppressLint("MissingPermission")
+    private BluetoothSocket connectWithFallbacks(BluetoothDevice device) throws IOException {
+        IOException secureError;
+        BluetoothSocket socket = null;
+
+        try {
+            socket = device.createRfcommSocketToServiceRecord(SPP_UUID);
+            socket.connect();
+            return socket;
+        } catch (IOException e) {
+            secureError = e;
+            closeQuietly(socket);
+        }
+
+        if (!isRunning.get()) throw secureError;
+        notifyState("CONNECTING", "Secure SPP failed; trying insecure SPP.");
+        IOException insecureError;
+        socket = null;
+        try {
+            socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID);
+            socket.connect();
+            return socket;
+        } catch (IOException e) {
+            insecureError = e;
+            closeQuietly(socket);
+        }
+
+        if (!isRunning.get()) throw insecureError;
+        notifyState("CONNECTING", "SPP UUID failed; trying HC-05 RFCOMM channel 1.");
+
+        // Compatibility fallback used by some HC-05 modules when UUID-based RFCOMM fails.
+        // This hidden Android API is intentionally isolated as a last resort.
+        socket = null;
+        try {
+            Method createRfcommSocket = device.getClass().getMethod("createRfcommSocket", int.class);
+            socket = (BluetoothSocket) createRfcommSocket.invoke(device, 1);
+            socket.connect();
+            return socket;
+        } catch (NoSuchMethodException | IllegalAccessException e) {
+            closeQuietly(socket);
+            IOException failure = new IOException("HC-05 channel 1 fallback unavailable; secure: "
+                    + messageOf(secureError) + "; insecure: " + messageOf(insecureError), e);
+            throw failure;
+        } catch (InvocationTargetException e) {
+            closeQuietly(socket);
+            Throwable cause = e.getCause();
+            IOException failure = new IOException("RFCOMM channel 1 failed; secure: "
+                    + messageOf(secureError) + "; insecure: " + messageOf(insecureError)
+                    + "; channel 1: " + messageOf(cause), cause);
+            throw failure;
+        } catch (IOException e) {
+            closeQuietly(socket);
+            IOException failure = new IOException("RFCOMM channel 1 failed; secure: "
+                    + messageOf(secureError) + "; insecure: " + messageOf(insecureError)
+                    + "; channel 1: " + messageOf(e), e);
+            throw failure;
+        }
+    }
+
+    private static String messageOf(Throwable error) {
+        if (error == null) return "unknown error";
+        return error.getClass().getSimpleName()
+                + (error.getMessage() == null ? "" : ": " + error.getMessage());
     }
 
     private void readStream(InputStream in) {
