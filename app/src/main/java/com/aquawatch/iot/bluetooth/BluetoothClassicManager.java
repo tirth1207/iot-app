@@ -32,17 +32,18 @@ public class BluetoothClassicManager {
     private final ExecutorService workerExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
 
-    private BluetoothSocket activeSocket = null;
-    private BluetoothEventListener listener;
+    private volatile BluetoothSocket activeSocket;
+    private volatile BluetoothEventListener listener;
 
     public BluetoothClassicManager() {
-        this.bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+        bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
     }
 
     public void setListener(BluetoothEventListener listener) {
         this.listener = listener;
     }
 
+    @SuppressLint("MissingPermission")
     public boolean isBluetoothEnabled() {
         return bluetoothAdapter != null && bluetoothAdapter.isEnabled();
     }
@@ -51,7 +52,7 @@ public class BluetoothClassicManager {
     public List<BluetoothDevice> getBondedDevices() {
         if (!isBluetoothEnabled()) return Collections.emptyList();
         Set<BluetoothDevice> paired = bluetoothAdapter.getBondedDevices();
-        return (paired != null) ? new ArrayList<>(paired) : Collections.emptyList();
+        return paired != null ? new ArrayList<>(paired) : Collections.emptyList();
     }
 
     @SuppressLint("MissingPermission")
@@ -66,40 +67,76 @@ public class BluetoothClassicManager {
 
         workerExecutor.execute(() -> {
             int attempts = 0;
+            String lastError = "Unknown Bluetooth error";
+
             while (isRunning.get() && attempts < MAX_RETRIES) {
                 attempts++;
                 notifyState("CONNECTING", "Attempt " + attempts + " of " + MAX_RETRIES);
 
-                BluetoothDevice device;
+                final BluetoothDevice device;
                 try {
                     device = bluetoothAdapter.getRemoteDevice(macAddress);
                 } catch (IllegalArgumentException e) {
-                    notifyState("ERROR", "Invalid MAC address: " + macAddress);
+                    notifyState("ERROR", "Invalid Bluetooth MAC address: " + macAddress);
+                    isRunning.set(false);
+                    return;
+                } catch (SecurityException e) {
+                    notifyState("ERROR", "Bluetooth permission denied. Allow Nearby devices permission for AquaWatch.");
+                    isRunning.set(false);
                     return;
                 }
 
+                BluetoothSocket socket = null;
                 try {
                     bluetoothAdapter.cancelDiscovery();
-                    BluetoothSocket socket = device.createRfcommSocketToServiceRecord(SPP_UUID);
-                    socket.connect();
+
+                    // Try the normal authenticated SPP connection first.
+                    try {
+                        socket = device.createRfcommSocketToServiceRecord(SPP_UUID);
+                        socket.connect();
+                    } catch (IOException secureError) {
+                        closeQuietly(socket);
+                        socket = null;
+                        if (!isRunning.get()) return;
+
+                        // Some HC-05 firmware/configurations work only with insecure RFCOMM.
+                        notifyState("CONNECTING", "Secure connection failed; trying HC-05 compatibility mode.");
+                        socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID);
+                        socket.connect();
+                    }
+
+                    if (!isRunning.get()) {
+                        closeQuietly(socket);
+                        return;
+                    }
+
                     activeSocket = socket;
-
                     String name = device.getName() != null ? device.getName() : "HC-05";
-                    notifyState("CONNECTED", name + " (" + macAddress + ")");
+                    notifyState("CONNECTED", "Connected to " + name + " (" + macAddress + ")");
                     parser.reset();
-
                     readStream(socket.getInputStream());
                     break;
+                } catch (SecurityException e) {
+                    closeQuietly(socket);
+                    notifyState("ERROR", "Bluetooth permission denied. Allow Nearby devices permission for AquaWatch.");
+                    isRunning.set(false);
+                    return;
                 } catch (IOException e) {
-                    closeSocket();
+                    lastError = e.getClass().getSimpleName()
+                            + (e.getMessage() == null ? "" : ": " + e.getMessage());
+                    closeQuietly(socket);
+                    activeSocket = null;
+
                     if (attempts >= MAX_RETRIES) {
-                        notifyState("ERROR", "Connection failed after " + MAX_RETRIES + " attempts.");
+                        notifyState("ERROR", "Connection failed after " + MAX_RETRIES + " attempts. Last error: " + lastError);
+                        isRunning.set(false);
                         return;
                     }
                     try {
-                        Thread.sleep(2000L * attempts);
-                    } catch (InterruptedException ie) {
+                        Thread.sleep(1500L * attempts);
+                    } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
+                        isRunning.set(false);
                         return;
                     }
                 }
@@ -116,20 +153,23 @@ public class BluetoothClassicManager {
 
                 List<ParsedRecord> records = parser.feed(buffer, bytesRead);
                 for (ParsedRecord record : records) {
-                    if (listener != null) {
-                        listener.onRecordReceived(record);
+                    BluetoothEventListener current = listener;
+                    if (current != null) {
+                        current.onRecordReceived(record);
                         if (record instanceof ParsedRecord.Telemetry) {
-                            ParsedRecord.Telemetry t = (ParsedRecord.Telemetry) record;
-                            listener.onRawMessage(t.levelPercent + "% | " + t.distanceCm + "cm | " + t.status);
+                            ParsedRecord.Telemetry telemetry = (ParsedRecord.Telemetry) record;
+                            current.onRawMessage(telemetry.levelPercent + "% | "
+                                    + telemetry.distanceCm + "cm | " + telemetry.status);
                         }
                     }
                 }
             }
         } catch (IOException ignored) {
+            // The connection-state update below reports the disconnect.
         } finally {
             closeSocket();
             if (isRunning.get()) {
-                notifyState("DISCONNECTED", "Connection lost");
+                notifyState("DISCONNECTED", "Bluetooth connection lost while reading serial data.");
             }
         }
     }
@@ -141,17 +181,25 @@ public class BluetoothClassicManager {
     }
 
     private synchronized void closeSocket() {
-        if (activeSocket != null) {
+        BluetoothSocket socket = activeSocket;
+        activeSocket = null;
+        closeQuietly(socket);
+    }
+
+    private static void closeQuietly(BluetoothSocket socket) {
+        if (socket != null) {
             try {
-                activeSocket.close();
-            } catch (IOException ignored) {}
-            activeSocket = null;
+                socket.close();
+            } catch (IOException ignored) {
+                // Best-effort cleanup.
+            }
         }
     }
 
     private void notifyState(String state, String details) {
-        if (listener != null) {
-            listener.onConnectionStateChanged(state, details);
+        BluetoothEventListener current = listener;
+        if (current != null) {
+            current.onConnectionStateChanged(state, details);
         }
     }
 }
