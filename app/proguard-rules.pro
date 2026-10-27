@@ -1,0 +1,2 @@
+-keep class com.aquawatch.iot.data.local.** { *; }
+-dontwarn okhttp3.**
