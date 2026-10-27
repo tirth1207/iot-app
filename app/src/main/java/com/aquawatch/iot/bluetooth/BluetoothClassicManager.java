@@ -100,7 +100,7 @@ public class BluetoothClassicManager {
 
                     activeSocket = socket;
                     String name = device.getName() != null ? device.getName() : "HC-05";
-                    notifyState("CONNECTED", "Connected to " + name + " (" + macAddress + ")");
+                    notifyState("CONNECTED", "Connected to " + name + " (" + macAddress + "); opening serial input stream.");
                     parser.reset();
                     readStream(socket.getInputStream());
                     break;
@@ -147,7 +147,7 @@ public class BluetoothClassicManager {
         }
 
         if (!isRunning.get()) throw secureError;
-        notifyState("CONNECTING", "Secure SPP failed; trying insecure SPP.");
+        notifyState("CONNECTING", "Secure SPP failed (" + messageOf(secureError) + "); trying insecure SPP.");
         IOException insecureError;
         socket = null;
         try {
@@ -160,7 +160,7 @@ public class BluetoothClassicManager {
         }
 
         if (!isRunning.get()) throw insecureError;
-        notifyState("CONNECTING", "SPP UUID failed; trying HC-05 RFCOMM channel 1.");
+        notifyState("CONNECTING", "Insecure SPP failed (" + messageOf(insecureError) + "); trying HC-05 RFCOMM channel 1.");
 
         // Compatibility fallback used by some HC-05 modules when UUID-based RFCOMM fails.
         // This hidden Android API is intentionally isolated as a last resort.
