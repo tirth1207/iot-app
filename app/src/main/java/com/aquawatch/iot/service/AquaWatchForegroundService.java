@@ -80,8 +80,8 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
     @Override
     public void onCreate() {
         super.onCreate();
-        logBreadcrumb("SERVICE: created");
         try {
+            logBreadcrumb("SERVICE: created");
             app = (AquaWatchApp) getApplication();
             btManager = app.getBluetoothManager();
             // Register before connect() can be called so CONNECTING is never missed.
