@@ -3,6 +3,8 @@ package com.aquawatch.iot.ui;
 import android.Manifest;
 import android.bluetooth.BluetoothDevice;
 import android.content.BroadcastReceiver;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -26,15 +28,20 @@ import com.aquawatch.iot.R;
 import com.aquawatch.iot.databinding.ActivityMainBinding;
 import com.aquawatch.iot.service.AquaWatchForegroundService;
 
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.Executors;
 
 public class MainActivity extends AppCompatActivity {
     private static final int REQ_PERMISSIONS = 101;
+    private static final int MAX_LOG_CHARS = 18000;
     private ActivityMainBinding binding;
     private AquaWatchApp app;
+    private final StringBuilder debugLog = new StringBuilder();
+    private final SimpleDateFormat logTime = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
     private final BroadcastReceiver telemetryReceiver = new BroadcastReceiver() {
         @Override
@@ -49,14 +56,17 @@ public class MainActivity extends AppCompatActivity {
                 binding.tvLevelPercentage.setText(String.format(Locale.US, "%.0f%%", level));
                 binding.tvDistance.setText(String.format(Locale.US, "%.1f cm", distance));
                 binding.tvCondition.setText(label);
+                appendDebug("TELEMETRY", String.format(Locale.US, "level=%.1f%% distance=%.1fcm status=%s", level, distance, label));
             } else if ("com.aquawatch.STATE_UPDATE".equals(action)) {
                 String state = intent.getStringExtra("state");
                 String details = intent.getStringExtra("details");
-                binding.tvConnectionTitle.setText(state);
-                binding.tvConnectionSub.setText(details);
+                binding.tvConnectionTitle.setText(state == null ? "Unknown" : state);
+                binding.tvConnectionSub.setText(details == null ? "" : details);
+                appendDebug(state == null ? "STATE" : state, details == null ? "" : details);
             } else if ("com.aquawatch.RAW_MSG".equals(action)) {
                 String raw = intent.getStringExtra("raw");
-                binding.tvRawSerial.setText(raw);
+                binding.tvRawSerial.setText(raw == null ? "" : raw);
+                appendDebug("SERIAL", raw == null ? "" : raw);
             }
         }
     };
@@ -69,6 +79,7 @@ public class MainActivity extends AppCompatActivity {
         app = (AquaWatchApp) getApplication();
 
         checkAndRequestPermissions();
+        appendDebug("APP", "AquaWatch opened. Bluetooth debug console ready.");
 
         binding.btnConnect.setOnClickListener(v -> showDeviceSelectionDialog());
         binding.btnSettings.setOnClickListener(v -> showSettingsDialog());
@@ -78,6 +89,37 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> Toast.makeText(this, "Local database reset.", Toast.LENGTH_SHORT).show());
             });
         });
+        binding.btnCopyLogs.setOnClickListener(v -> {
+            String logs = debugLog.toString();
+            if (logs.isEmpty()) logs = "No diagnostic events recorded yet.";
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard != null) {
+                clipboard.setPrimaryClip(ClipData.newPlainText("AquaWatch Bluetooth Debug Logs", logs));
+                Toast.makeText(this, "Debug logs copied. Paste them into the chat.", Toast.LENGTH_LONG).show();
+            }
+        });
+        binding.btnClearLogs.setOnClickListener(v -> {
+            debugLog.setLength(0);
+            binding.tvDebugLog.setText("Logs cleared. Tap Connect to run a fresh diagnostic.");
+            appendDebug("APP", "Debug log cleared.");
+        });
+    }
+
+    private void appendDebug(String category, String message) {
+        String line = "[" + logTime.format(new Date()) + "] " + category + ": " + message;
+        debugLog.append(line).append('\n');
+        if (debugLog.length() > MAX_LOG_CHARS) {
+            debugLog.delete(0, debugLog.length() - MAX_LOG_CHARS);
+        }
+        if (binding != null) {
+            binding.tvDebugLog.setText(debugLog.toString());
+            binding.tvDebugLog.post(() -> {
+                if (binding.tvDebugLog.getLayout() != null) {
+                    int scrollAmount = binding.tvDebugLog.getLayout().getLineTop(binding.tvDebugLog.getLineCount()) - binding.tvDebugLog.getHeight();
+                    if (scrollAmount > 0) binding.tvDebugLog.scrollTo(0, scrollAmount);
+                }
+            });
+        }
     }
 
     @Override
@@ -92,12 +134,17 @@ public class MainActivity extends AppCompatActivity {
         } else {
             registerReceiver(telemetryReceiver, filter);
         }
+        appendDebug("APP", "Main screen resumed; listening for Bluetooth state and serial data.");
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        unregisterReceiver(telemetryReceiver);
+        try {
+            unregisterReceiver(telemetryReceiver);
+        } catch (IllegalArgumentException ignored) {
+            // Receiver may already have been unregistered.
+        }
     }
 
     private void showSettingsDialog() {
@@ -136,12 +183,14 @@ public class MainActivity extends AppCompatActivity {
     private void showDeviceSelectionDialog() {
         if (!app.getBluetoothManager().isBluetoothEnabled()) {
             Toast.makeText(this, "Bluetooth is not enabled. Please enable Bluetooth in Android Settings.", Toast.LENGTH_LONG).show();
+            appendDebug("ERROR", "Bluetooth adapter is disabled.");
             return;
         }
 
         List<BluetoothDevice> bonded = app.getBluetoothManager().getBondedDevices();
         if (bonded.isEmpty()) {
             Toast.makeText(this, "No paired devices found. Pair HC-05 in Android Settings first.", Toast.LENGTH_LONG).show();
+            appendDebug("ERROR", "No paired Bluetooth devices returned by Android.");
             return;
         }
 
@@ -153,13 +202,17 @@ public class MainActivity extends AppCompatActivity {
                 String name = dev.getName() != null ? dev.getName() : "Unknown";
                 deviceLabels.add(name + "\n" + dev.getAddress());
                 macAddresses.add(dev.getAddress());
-            } catch (SecurityException ignored) {}
+                appendDebug("DEVICE", "Paired device found: " + name + " [" + dev.getAddress() + "]");
+            } catch (SecurityException e) {
+                appendDebug("ERROR", "Could not read paired device details: " + e);
+            }
         }
 
         new AlertDialog.Builder(this)
                 .setTitle("Select Arduino HC-05")
                 .setItems(deviceLabels.toArray(new String[0]), (dialog, which) -> {
                     String selectedMac = macAddresses.get(which);
+                    appendDebug("APP", "User selected Bluetooth device " + selectedMac);
                     AquaWatchForegroundService.start(MainActivity.this, selectedMac);
                 })
                 .setNegativeButton("Cancel", null)
@@ -192,8 +245,7 @@ public class MainActivity extends AppCompatActivity {
         if (!needed.isEmpty()) {
             ActivityCompat.requestPermissions(this, needed.toArray(new String[0]), REQ_PERMISSIONS);
         } else {
-            // All required permissions already granted - proceed with Bluetooth operations
-            app.getBluetoothManager().getBondedDevices(); // ensure BT is accessible
+            app.getBluetoothManager().getBondedDevices();
         }
     }
 
@@ -210,6 +262,7 @@ public class MainActivity extends AppCompatActivity {
             }
             if (!allGranted) {
                 Toast.makeText(this, "Permissions required for Bluetooth monitoring.", Toast.LENGTH_LONG).show();
+                appendDebug("ERROR", "One or more Android permissions were denied.");
             }
         }
     }
