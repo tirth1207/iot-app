@@ -180,7 +180,18 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
+    private boolean hasBluetoothConnectPermission() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                || ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+    }
+
     private void showDeviceSelectionDialog() {
+        if (!hasBluetoothConnectPermission()) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("open_device_dialog_after_permission", true).apply();
+            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.BLUETOOTH_CONNECT}, REQ_PERMISSIONS);
+            appendDebug("ERROR", "PERMISSION_DENIED: request Nearby devices (BLUETOOTH_CONNECT) before listing paired devices.");
+            return;
+        }
         if (!app.getBluetoothManager().isBluetoothEnabled()) {
             Toast.makeText(this, "Bluetooth is not enabled. Please enable Bluetooth in Android Settings.", Toast.LENGTH_LONG).show();
             appendDebug("ERROR", "Bluetooth adapter is disabled.");
@@ -188,6 +199,10 @@ public class MainActivity extends AppCompatActivity {
         }
 
         List<BluetoothDevice> bonded = app.getBluetoothManager().getBondedDevices();
+        if (!hasBluetoothConnectPermission()) {
+            appendDebug("ERROR", "PERMISSION_DENIED: Android denied BLUETOOTH_CONNECT while reading paired devices.");
+            return;
+        }
         if (bonded.isEmpty()) {
             Toast.makeText(this, "No paired devices found. Pair HC-05 in Android Settings first.", Toast.LENGTH_LONG).show();
             appendDebug("ERROR", "No paired Bluetooth devices returned by Android.");
@@ -228,13 +243,14 @@ public class MainActivity extends AppCompatActivity {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
                 needed.add(Manifest.permission.BLUETOOTH_CONNECT);
             }
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                needed.add(Manifest.permission.ACCESS_FINE_LOCATION);
-            }
         } else {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
                 needed.add(Manifest.permission.ACCESS_FINE_LOCATION);
             }
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION);
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -252,18 +268,27 @@ public class MainActivity extends AppCompatActivity {
     @Override
     public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQ_PERMISSIONS) {
-            boolean allGranted = true;
-            for (int result : grantResults) {
-                if (result != PackageManager.PERMISSION_GRANTED) {
-                    allGranted = false;
-                    break;
-                }
-            }
-            if (!allGranted) {
-                Toast.makeText(this, "Permissions required for Bluetooth monitoring.", Toast.LENGTH_LONG).show();
-                appendDebug("ERROR", "One or more Android permissions were denied.");
-            }
+        if (requestCode != REQ_PERMISSIONS) return;
+
+        boolean connectGranted = hasBluetoothConnectPermission();
+        boolean legacyLocationDenied = Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED;
+        boolean scanDenied = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED;
+        boolean notificationsDenied = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED;
+
+        if (!connectGranted) {
+            appendDebug("ERROR", "PERMISSION_DENIED: Nearby devices / BLUETOOTH_CONNECT was denied. Bluetooth connection is blocked.");
+            Toast.makeText(this, "Allow Nearby devices permission to connect to HC-05.", Toast.LENGTH_LONG).show();
+            getPreferences(MODE_PRIVATE).edit().putBoolean("open_device_dialog_after_permission", false).apply();
+            return;
         }
+        if (legacyLocationDenied || scanDenied || notificationsDenied) {
+            appendDebug("WARN", "Optional permission denied (scan/location/notifications); BLUETOOTH_CONNECT is granted, so connecting remains available.");
+        }
+        boolean openDialog = getPreferences(MODE_PRIVATE).getBoolean("open_device_dialog_after_permission", false);
+        getPreferences(MODE_PRIVATE).edit().putBoolean("open_device_dialog_after_permission", false).apply();
+        if (openDialog) showDeviceSelectionDialog();
     }
 }
