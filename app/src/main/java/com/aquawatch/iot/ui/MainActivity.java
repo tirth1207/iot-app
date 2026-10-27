@@ -165,6 +165,7 @@ public class MainActivity extends AppCompatActivity implements BluetoothClassicM
     protected void onResume() {
         super.onResume();
         app.getBluetoothManager().addListener(this);
+        lastStateKey = "";
         IntentFilter filter = new IntentFilter();
         filter.addAction("com.aquawatch.TELEMETRY_UPDATE");
         filter.addAction("com.aquawatch.STATE_UPDATE");
