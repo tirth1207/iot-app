@@ -180,6 +180,8 @@ public class MainActivity extends AppCompatActivity implements BluetoothClassicM
         }
         appendDebug("APP", "Main screen resumed; listening for Bluetooth state and serial data.");
         for (String breadcrumb : AquaWatchApp.getBreadcrumbs(this)) appendDebug("TRACE", breadcrumb);
+        String lastCrashOnResume = AquaWatchApp.consumeLastCrash(this);
+        if (lastCrashOnResume != null && !lastCrashOnResume.isEmpty()) appendDebug("LAST CRASH", lastCrashOnResume);
     }
 
     @Override
