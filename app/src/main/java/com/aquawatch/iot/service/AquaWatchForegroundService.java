@@ -164,9 +164,13 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
                 startForeground(NOTIF_ID, notification);
             }
             logBreadcrumb("SERVICE: foreground started");
+        } catch (IllegalStateException | SecurityException t) {
+            // Includes ForegroundServiceStartNotAllowedException (API 31+) and
+            // MissingForegroundServiceTypeException (API 34+), which are IllegalStateException subclasses.
+            reportError("startForeground failed (" + t.getClass().getSimpleName() + ")", t);
+            throw t;
         } catch (Throwable t) {
-            // API 31+ foreground-start restrictions are IllegalStateException subclasses.
-            reportError("startForeground failed", t);
+            reportError("startForeground failed unexpectedly", t);
             throw t;
         }
     }
