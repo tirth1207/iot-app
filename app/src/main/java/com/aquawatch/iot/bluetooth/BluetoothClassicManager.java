@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothSocket;
+import android.util.Log;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -24,6 +25,7 @@ public class BluetoothClassicManager {
     public static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final int BUFFER_SIZE = 512;
     private static final int MAX_RETRIES = 3;
+    private static final String TAG = "AquaWatchBT";
 
     public interface BluetoothEventListener {
         void onConnectionStateChanged(String state, String details);
@@ -73,63 +75,85 @@ public class BluetoothClassicManager {
 
     @SuppressLint("MissingPermission")
     public void connect(final String macAddress) {
-        if (bluetoothAdapter == null || !isBluetoothEnabled()) {
-            notifyState("ERROR", "Bluetooth is disabled or unavailable.");
-            return;
-        }
-        disconnectInternal(false);
-        final int taskGeneration = generation.incrementAndGet();
-        workerExecutor.shutdownNow();
-        workerExecutor = Executors.newSingleThreadExecutor();
-        connectionTask = workerExecutor.submit(() -> {
-            BluetoothDevice device;
-            try {
-                device = bluetoothAdapter.getRemoteDevice(macAddress);
-                if (device.getBondState() != BluetoothDevice.BOND_BONDED) {
-                    notifyState("ERROR", "NOT_BONDED: Pair HC-05 in Android Settings first (PIN 1234 or 0000).");
-                    return;
-                }
-            } catch (SecurityException e) {
-                notifyState("ERROR", "PERMISSION_DENIED: grant Nearby devices / BLUETOOTH_CONNECT permission. " + messageOf(e));
-                return;
-            } catch (IllegalArgumentException e) {
-                notifyState("ERROR", "Invalid Bluetooth MAC address: " + macAddress);
+        Log.d(TAG, "BT: connect() called");
+        try {
+            if (bluetoothAdapter == null || !isBluetoothEnabled()) {
+                notifyState("ERROR", "Bluetooth is disabled or unavailable.");
                 return;
             }
-
-            for (int attempt = 1; attempt <= MAX_RETRIES && isCurrent(taskGeneration); attempt++) {
-                BluetoothSocket socket = null;
+            disconnectInternal(false);
+            final int taskGeneration = generation.incrementAndGet();
+            workerExecutor.shutdownNow();
+            workerExecutor = Executors.newSingleThreadExecutor();
+            connectionTask = workerExecutor.submit(() -> {
+                BluetoothDevice device;
                 try {
-                    notifyState("CONNECTING", "Attempt " + attempt + " of " + MAX_RETRIES + " to " + safeName(device));
-                    bluetoothAdapter.cancelDiscovery();
-                    socket = connectWithFallbacks(device, taskGeneration);
-                    if (!isCurrent(taskGeneration)) { closeQuietly(socket); return; }
-                    activeSocket = socket;
-                    connectingSocket = null;
-                    parser.reset();
-                    notifyState("CONNECTED", "Connected to " + safeName(device) + " (" + macAddress + "); waiting for serial data.");
-                    readStream(socket.getInputStream(), taskGeneration);
-                    return;
-                } catch (SecurityException e) {
-                    closeQuietly(socket);
-                    notifyState("ERROR", "PERMISSION_DENIED: BLUETOOTH_CONNECT was denied or revoked. " + messageOf(e));
-                    return;
-                } catch (IOException e) {
-                    closeQuietly(socket);
-                    if (connectingSocket == socket) connectingSocket = null;
-                    activeSocket = null;
-                    if (!isCurrent(taskGeneration)) return;
-                    if (attempt == MAX_RETRIES) {
-                        notifyState("ERROR", "RFCOMM connect failed (" + messageOf(e) + "). Failed after " + MAX_RETRIES + " attempts.");
+                    device = bluetoothAdapter.getRemoteDevice(macAddress);
+                    int bondState = device.getBondState();
+                    Log.d(TAG, "BT: bond state = " + bondState);
+                    if (bondState != BluetoothDevice.BOND_BONDED) {
+                        notifyState("ERROR", "NOT_BONDED: Pair HC-05 in Android Settings first (PIN 1234 or 0000). Bond state = " + bondState);
                         return;
                     }
-                    try { Thread.sleep(400L); }
-                    catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
-                } finally {
-                    if (connectingSocket == socket) connectingSocket = null;
+                } catch (SecurityException e) {
+                    notifyState("ERROR", "PERMISSION_DENIED: grant Nearby devices / BLUETOOTH_CONNECT permission. " + messageOf(e));
+                    return;
+                } catch (IllegalArgumentException e) {
+                    notifyState("ERROR", "Invalid Bluetooth MAC address: " + macAddress);
+                    return;
+                } catch (Throwable t) {
+                    reportThrowable("BT: worker failed before socket creation", t);
+                    return;
                 }
-            }
-        });
+
+                for (int attempt = 1; attempt <= MAX_RETRIES && isCurrent(taskGeneration); attempt++) {
+                    BluetoothSocket socket = null;
+                    try {
+                        notifyState("CONNECTING", "Attempt " + attempt + " of " + MAX_RETRIES + " to " + safeName(device));
+                        bluetoothAdapter.cancelDiscovery();
+                        socket = connectWithFallbacks(device, taskGeneration);
+                        if (!isCurrent(taskGeneration)) { closeQuietly(socket); return; }
+                        activeSocket = socket;
+                        connectingSocket = null;
+                        parser.reset();
+                        notifyState("CONNECTED", "Connected to " + safeName(device) + " (" + macAddress + "); waiting for serial data.");
+                        readStream(socket.getInputStream(), taskGeneration);
+                        return;
+                    } catch (SecurityException e) {
+                        closeQuietly(socket);
+                        notifyState("ERROR", "PERMISSION_DENIED: BLUETOOTH_CONNECT was denied or revoked. " + messageOf(e));
+                        return;
+                    } catch (IOException e) {
+                        closeQuietly(socket);
+                        if (connectingSocket == socket) connectingSocket = null;
+                        activeSocket = null;
+                        if (!isCurrent(taskGeneration)) return;
+                        if (attempt == MAX_RETRIES) {
+                            notifyState("ERROR", "RFCOMM connect failed (" + messageOf(e) + "). Failed after " + MAX_RETRIES + " attempts.");
+                            return;
+                        }
+                        try { Thread.sleep(400L); }
+                        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+                    } catch (Throwable t) {
+                        closeQuietly(socket);
+                        reportThrowable("BT: connection attempt " + attempt + " crashed", t);
+                        return;
+                    } finally {
+                        if (connectingSocket == socket) connectingSocket = null;
+                    }
+                }
+            });
+            Log.d(TAG, "BT: worker thread started");
+        } catch (Throwable t) {
+            reportThrowable("BT: connect() failed synchronously", t);
+        }
+    }
+
+    private void reportThrowable(String context, Throwable throwable) {
+        Log.e(TAG, context, throwable);
+        java.io.StringWriter sw = new java.io.StringWriter();
+        throwable.printStackTrace(new java.io.PrintWriter(sw));
+        notifyState("ERROR", context + ": " + throwable + "\n" + sw);
     }
 
     @SuppressLint("MissingPermission")
@@ -217,6 +241,8 @@ public class BluetoothClassicManager {
             }
         } catch (IOException e) {
             if (isCurrent(taskGeneration)) notifyState("DISCONNECTED", "RFCOMM stream read failed: " + messageOf(e));
+        } catch (Throwable t) {
+            reportThrowable("BT: serial reader crashed", t);
         } finally {
             if (isCurrent(taskGeneration)) {
                 closeQuietly(activeSocket); activeSocket = null;
@@ -247,6 +273,13 @@ public class BluetoothClassicManager {
     }
 
     private void notifyState(String state, String details) {
-        for (BluetoothEventListener current : listeners) current.onConnectionStateChanged(state, details);
+        Log.d(TAG, "BT STATE " + state + ": " + details);
+        for (BluetoothEventListener current : listeners) {
+            try {
+                current.onConnectionStateChanged(state, details);
+            } catch (Throwable listenerError) {
+                Log.e(TAG, "A Bluetooth state listener threw", listenerError);
+            }
+        }
     }
 }
