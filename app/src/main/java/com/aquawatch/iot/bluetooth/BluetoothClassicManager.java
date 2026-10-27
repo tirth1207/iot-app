@@ -16,12 +16,14 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Future;
 
 public class BluetoothClassicManager {
     public static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final int BUFFER_SIZE = 512;
-    private static final int MAX_RETRIES = 5;
+    private static final int MAX_RETRIES = 3;
 
     public interface BluetoothEventListener {
         void onConnectionStateChanged(String state, String details);
@@ -31,164 +33,160 @@ public class BluetoothClassicManager {
 
     private final BluetoothAdapter bluetoothAdapter;
     private final StreamingSerialParser parser = new StreamingSerialParser();
-    private final ExecutorService workerExecutor = Executors.newSingleThreadExecutor();
-    private final AtomicBoolean isRunning = new AtomicBoolean(false);
-
+    private volatile ExecutorService workerExecutor = Executors.newSingleThreadExecutor();
+    private final AtomicInteger generation = new AtomicInteger(0);
+    private final CopyOnWriteArrayList<BluetoothEventListener> listeners = new CopyOnWriteArrayList<>();
+    private volatile Future<?> connectionTask;
     private volatile BluetoothSocket activeSocket;
-    private volatile BluetoothEventListener listener;
+    private volatile BluetoothSocket connectingSocket;
 
     public BluetoothClassicManager() {
         bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
     }
 
-    public void setListener(BluetoothEventListener listener) {
-        this.listener = listener;
+    public void setListener(BluetoothEventListener listener) { addListener(listener); }
+
+    public void addListener(BluetoothEventListener listener) {
+        if (listener != null && !listeners.contains(listener)) listeners.add(listener);
     }
+
+    public void removeListener(BluetoothEventListener listener) { listeners.remove(listener); }
 
     @SuppressLint("MissingPermission")
     public boolean isBluetoothEnabled() {
-        return bluetoothAdapter != null && bluetoothAdapter.isEnabled();
+        if (bluetoothAdapter == null) return false;
+        try { return bluetoothAdapter.isEnabled(); }
+        catch (SecurityException e) { notifyState("ERROR", "PERMISSION_DENIED: BLUETOOTH_CONNECT is required. " + messageOf(e)); return false; }
     }
 
     @SuppressLint("MissingPermission")
     public List<BluetoothDevice> getBondedDevices() {
-        if (!isBluetoothEnabled()) return Collections.emptyList();
-        Set<BluetoothDevice> paired = bluetoothAdapter.getBondedDevices();
-        return paired != null ? new ArrayList<>(paired) : Collections.emptyList();
+        try {
+            if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) return Collections.emptyList();
+            Set<BluetoothDevice> paired = bluetoothAdapter.getBondedDevices();
+            return paired != null ? new ArrayList<>(paired) : Collections.emptyList();
+        } catch (SecurityException e) {
+            notifyState("ERROR", "PERMISSION_DENIED: BLUETOOTH_CONNECT is required to list paired devices. " + messageOf(e));
+            return Collections.emptyList();
+        }
     }
 
     @SuppressLint("MissingPermission")
     public void connect(final String macAddress) {
-        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
-            notifyState("ERROR", "Bluetooth is not enabled on this device.");
+        if (bluetoothAdapter == null || !isBluetoothEnabled()) {
+            notifyState("ERROR", "Bluetooth is disabled or unavailable.");
             return;
         }
-
-        disconnect();
-        isRunning.set(true);
-
-        workerExecutor.execute(() -> {
-            int attempts = 0;
-            String lastError = "Unknown Bluetooth error";
-
-            while (isRunning.get() && attempts < MAX_RETRIES) {
-                attempts++;
-                notifyState("CONNECTING", "Attempt " + attempts + " of " + MAX_RETRIES);
-
-                final BluetoothDevice device;
-                try {
-                    device = bluetoothAdapter.getRemoteDevice(macAddress);
-                } catch (IllegalArgumentException e) {
-                    notifyState("ERROR", "Invalid Bluetooth MAC address: " + macAddress);
-                    isRunning.set(false);
-                    return;
-                } catch (SecurityException e) {
-                    notifyState("ERROR", "Bluetooth permission denied. Allow Nearby devices permission for AquaWatch.");
-                    isRunning.set(false);
+        disconnectInternal(false);
+        final int taskGeneration = generation.incrementAndGet();
+        workerExecutor.shutdownNow();
+        workerExecutor = Executors.newSingleThreadExecutor();
+        connectionTask = workerExecutor.submit(() -> {
+            BluetoothDevice device;
+            try {
+                device = bluetoothAdapter.getRemoteDevice(macAddress);
+                if (device.getBondState() != BluetoothDevice.BOND_BONDED) {
+                    notifyState("ERROR", "NOT_BONDED: Pair HC-05 in Android Settings first (PIN 1234 or 0000).");
                     return;
                 }
+            } catch (SecurityException e) {
+                notifyState("ERROR", "PERMISSION_DENIED: grant Nearby devices / BLUETOOTH_CONNECT permission. " + messageOf(e));
+                return;
+            } catch (IllegalArgumentException e) {
+                notifyState("ERROR", "Invalid Bluetooth MAC address: " + macAddress);
+                return;
+            }
 
+            for (int attempt = 1; attempt <= MAX_RETRIES && isCurrent(taskGeneration); attempt++) {
                 BluetoothSocket socket = null;
                 try {
+                    notifyState("CONNECTING", "Attempt " + attempt + " of " + MAX_RETRIES + " to " + safeName(device));
                     bluetoothAdapter.cancelDiscovery();
-                    socket = connectWithFallbacks(device);
-
-                    if (!isRunning.get()) {
-                        closeQuietly(socket);
-                        return;
-                    }
-
+                    socket = connectWithFallbacks(device, taskGeneration);
+                    if (!isCurrent(taskGeneration)) { closeQuietly(socket); return; }
                     activeSocket = socket;
-                    String name = device.getName() != null ? device.getName() : "HC-05";
-                    notifyState("CONNECTED", "Connected to " + name + " (" + macAddress + "); opening serial input stream.");
+                    connectingSocket = null;
                     parser.reset();
-                    readStream(socket.getInputStream());
-                    break;
+                    notifyState("CONNECTED", "Connected to " + safeName(device) + " (" + macAddress + "); waiting for serial data.");
+                    readStream(socket.getInputStream(), taskGeneration);
+                    return;
                 } catch (SecurityException e) {
                     closeQuietly(socket);
-                    notifyState("ERROR", "Bluetooth permission denied. Allow Nearby devices permission for AquaWatch.");
-                    isRunning.set(false);
+                    notifyState("ERROR", "PERMISSION_DENIED: BLUETOOTH_CONNECT was denied or revoked. " + messageOf(e));
                     return;
                 } catch (IOException e) {
-                    lastError = e.getClass().getSimpleName()
-                            + (e.getMessage() == null ? "" : ": " + e.getMessage());
                     closeQuietly(socket);
+                    if (connectingSocket == socket) connectingSocket = null;
                     activeSocket = null;
-
-                    if (attempts >= MAX_RETRIES) {
-                        notifyState("ERROR", "Connection failed after " + MAX_RETRIES + " attempts. Last error: " + lastError);
-                        isRunning.set(false);
+                    if (!isCurrent(taskGeneration)) return;
+                    if (attempt == MAX_RETRIES) {
+                        notifyState("ERROR", "RFCOMM connect failed (" + messageOf(e) + "). Failed after " + MAX_RETRIES + " attempts.");
                         return;
                     }
-                    try {
-                        Thread.sleep(1500L * attempts);
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        isRunning.set(false);
-                        return;
-                    }
+                    try { Thread.sleep(400L); }
+                    catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+                } finally {
+                    if (connectingSocket == socket) connectingSocket = null;
                 }
             }
         });
     }
 
     @SuppressLint("MissingPermission")
-    private BluetoothSocket connectWithFallbacks(BluetoothDevice device) throws IOException {
-        IOException secureError;
-        BluetoothSocket socket = null;
-
+    private BluetoothSocket connectWithFallbacks(BluetoothDevice device, int taskGeneration) throws IOException {
+        List<String> errors = new ArrayList<>();
+        // HC-05 commonly works best with insecure SPP, then RFCOMM channel 1.
         try {
-            socket = device.createRfcommSocketToServiceRecord(SPP_UUID);
+            BluetoothSocket socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID);
+            connectingSocket = socket;
+            bluetoothAdapter.cancelDiscovery();
             socket.connect();
             return socket;
-        } catch (IOException e) {
-            secureError = e;
-            closeQuietly(socket);
+        } catch (IOException | SecurityException e) {
+            errors.add("insecure SPP: " + messageOf(e));
+            closeQuietly(connectingSocket); connectingSocket = null;
+            if (e instanceof SecurityException) throw (SecurityException)e;
         }
-
-        if (!isRunning.get()) throw secureError;
-        notifyState("CONNECTING", "Secure SPP failed (" + messageOf(secureError) + "); trying insecure SPP.");
-        IOException insecureError;
-        socket = null;
+        if (!isCurrent(taskGeneration)) throw new IOException("Connection cancelled");
+        notifyState("CONNECTING", "Insecure SPP failed (" + errors.get(errors.size()-1) + "); trying channel 1.");
         try {
-            socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID);
+            Method method = device.getClass().getMethod("createRfcommSocket", int.class);
+            BluetoothSocket socket = (BluetoothSocket) method.invoke(device, 1);
+            connectingSocket = socket;
+            bluetoothAdapter.cancelDiscovery();
             socket.connect();
             return socket;
-        } catch (IOException e) {
-            insecureError = e;
-            closeQuietly(socket);
+        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException | IOException | SecurityException e) {
+            Throwable detail = e instanceof InvocationTargetException && ((InvocationTargetException)e).getCause() != null
+                    ? ((InvocationTargetException)e).getCause() : e;
+            errors.add("RFCOMM channel 1: " + messageOf(detail));
+            closeQuietly(connectingSocket); connectingSocket = null;
+            if (detail instanceof SecurityException) throw (SecurityException)detail;
         }
-
-        if (!isRunning.get()) throw insecureError;
-        notifyState("CONNECTING", "Insecure SPP failed (" + messageOf(insecureError) + "); trying HC-05 RFCOMM channel 1.");
-
-        // Compatibility fallback used by some HC-05 modules when UUID-based RFCOMM fails.
-        // This hidden Android API is intentionally isolated as a last resort.
-        socket = null;
+        if (!isCurrent(taskGeneration)) throw new IOException("Connection cancelled");
+        notifyState("CONNECTING", "Channel 1 failed (" + errors.get(errors.size()-1) + "); trying secure SPP.");
         try {
-            Method createRfcommSocket = device.getClass().getMethod("createRfcommSocket", int.class);
-            socket = (BluetoothSocket) createRfcommSocket.invoke(device, 1);
+            BluetoothSocket socket = device.createRfcommSocketToServiceRecord(SPP_UUID);
+            connectingSocket = socket;
+            bluetoothAdapter.cancelDiscovery();
             socket.connect();
             return socket;
-        } catch (NoSuchMethodException | IllegalAccessException e) {
-            closeQuietly(socket);
-            IOException failure = new IOException("HC-05 channel 1 fallback unavailable; secure: "
-                    + messageOf(secureError) + "; insecure: " + messageOf(insecureError), e);
-            throw failure;
-        } catch (InvocationTargetException e) {
-            closeQuietly(socket);
-            Throwable cause = e.getCause();
-            IOException failure = new IOException("RFCOMM channel 1 failed; secure: "
-                    + messageOf(secureError) + "; insecure: " + messageOf(insecureError)
-                    + "; channel 1: " + messageOf(cause), cause);
-            throw failure;
-        } catch (IOException e) {
-            closeQuietly(socket);
-            IOException failure = new IOException("RFCOMM channel 1 failed; secure: "
-                    + messageOf(secureError) + "; insecure: " + messageOf(insecureError)
-                    + "; channel 1: " + messageOf(e), e);
-            throw failure;
+        } catch (IOException | SecurityException e) {
+            errors.add("secure SPP: " + messageOf(e));
+            closeQuietly(connectingSocket); connectingSocket = null;
+            if (e instanceof SecurityException) throw (SecurityException)e;
         }
+        throw new IOException("All RFCOMM strategies failed: " + String.join(" | ", errors));
+    }
+
+    @SuppressLint("MissingPermission")
+    private String safeName(BluetoothDevice device) {
+        try { String name = device.getName(); return name == null ? "HC-05" : name; }
+        catch (SecurityException e) { notifyState("ERROR", "PERMISSION_DENIED reading device name: " + messageOf(e)); return "Bluetooth device"; }
+    }
+
+    private boolean isCurrent(int taskGeneration) {
+        return generation.get() == taskGeneration && !Thread.currentThread().isInterrupted();
     }
 
     private static String messageOf(Throwable error) {
@@ -197,46 +195,45 @@ public class BluetoothClassicManager {
                 + (error.getMessage() == null ? "" : ": " + error.getMessage());
     }
 
-    private void readStream(InputStream in) {
+    private void readStream(InputStream in, int taskGeneration) {
         byte[] buffer = new byte[BUFFER_SIZE];
+        boolean receivedAny = false;
         try {
-            while (isRunning.get()) {
+            while (isCurrent(taskGeneration)) {
                 int bytesRead = in.read(buffer);
-                if (bytesRead == -1) break;
-
+                if (bytesRead < 0) break;
+                if (bytesRead == 0) continue;
+                receivedAny = true;
                 List<ParsedRecord> records = parser.feed(buffer, bytesRead);
                 for (ParsedRecord record : records) {
-                    BluetoothEventListener current = listener;
-                    if (current != null) {
+                    for (BluetoothEventListener current : listeners) {
                         current.onRecordReceived(record);
                         if (record instanceof ParsedRecord.Telemetry) {
-                            ParsedRecord.Telemetry telemetry = (ParsedRecord.Telemetry) record;
-                            current.onRawMessage(telemetry.levelPercent + "% | "
-                                    + telemetry.distanceCm + "cm | " + telemetry.status);
+                            ParsedRecord.Telemetry t = (ParsedRecord.Telemetry) record;
+                            current.onRawMessage(t.levelPercent + "% | " + t.distanceCm + "cm | " + t.status);
                         }
                     }
                 }
             }
-        } catch (IOException ignored) {
-            // The connection-state update below reports the disconnect.
+        } catch (IOException e) {
+            if (isCurrent(taskGeneration)) notifyState("DISCONNECTED", "RFCOMM stream read failed: " + messageOf(e));
         } finally {
-            closeSocket();
-            if (isRunning.get()) {
-                notifyState("DISCONNECTED", "Bluetooth connection lost while reading serial data.");
+            if (isCurrent(taskGeneration)) {
+                closeQuietly(activeSocket); activeSocket = null;
+                if (!receivedAny) notifyState("DISCONNECTED", "Connected but no data: no serial bytes received. Check Arduino TX -> HC-05 RX and 9600 baud.");
             }
         }
     }
 
-    public synchronized void disconnect() {
-        isRunning.set(false);
-        closeSocket();
-        notifyState("DISCONNECTED", "Disconnected");
-    }
+    public synchronized void disconnect() { disconnectInternal(true); }
 
-    private synchronized void closeSocket() {
-        BluetoothSocket socket = activeSocket;
-        activeSocket = null;
-        closeQuietly(socket);
+    private synchronized void disconnectInternal(boolean notify) {
+        generation.incrementAndGet();
+        Future<?> task = connectionTask; connectionTask = null;
+        if (task != null) task.cancel(true);
+        closeQuietly(connectingSocket); connectingSocket = null;
+        closeQuietly(activeSocket); activeSocket = null;
+        if (notify) notifyState("DISCONNECTED", "Disconnected by user.");
     }
 
     private static void closeQuietly(BluetoothSocket socket) {
@@ -250,9 +247,6 @@ public class BluetoothClassicManager {
     }
 
     private void notifyState(String state, String details) {
-        BluetoothEventListener current = listener;
-        if (current != null) {
-            current.onConnectionStateChanged(state, details);
-        }
+        for (BluetoothEventListener current : listeners) current.onConnectionStateChanged(state, details);
     }
 }
