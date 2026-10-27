@@ -69,7 +69,7 @@ public class MainActivity extends AppCompatActivity implements BluetoothClassicM
         } else if ("com.aquawatch.STATE_UPDATE".equals(action)) {
             String state = intent.getStringExtra("state");
             String details = intent.getStringExtra("details");
-            renderState(state, details, true);
+            renderState(state, details);
         } else if ("com.aquawatch.RAW_MSG".equals(action)) {
             String raw = intent.getStringExtra("raw");
             binding.tvRawSerial.setText(raw == null ? "" : raw);
@@ -139,15 +139,15 @@ public class MainActivity extends AppCompatActivity implements BluetoothClassicM
         }
     }
 
-    private void renderState(String state, String details, boolean fromBroadcast) {
+    private void renderState(String state, String details) {
         if (LooperCompat.isMainThread()) {
-            renderStateOnUi(state, details, fromBroadcast);
+            renderStateOnUi(state, details);
         } else {
-            runOnUiThread(() -> renderStateOnUi(state, details, fromBroadcast));
+            runOnUiThread(() -> renderStateOnUi(state, details));
         }
     }
 
-    private void renderStateOnUi(String state, String details, boolean fromBroadcast) {
+    private void renderStateOnUi(String state, String details) {
         String safeState = state == null ? "Unknown" : state;
         String safeDetails = details == null ? "" : details;
         String key = safeState + "\n" + safeDetails;
@@ -203,7 +203,7 @@ public class MainActivity extends AppCompatActivity implements BluetoothClassicM
 
     @Override
     public void onConnectionStateChanged(String state, String details) {
-        renderState(state, details, false);
+        renderState(state, details);
     }
 
     @Override
