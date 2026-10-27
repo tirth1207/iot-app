@@ -9,6 +9,11 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
+import android.content.pm.PackageManager;
+import android.Manifest;
+import android.os.Handler;
+import android.os.Looper;
+import androidx.core.content.ContextCompat;
 import android.os.Build;
 import android.os.IBinder;
 
@@ -45,6 +50,12 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
 
     private long lastUploadTime = 0L;
     private static final long MIN_UPLOAD_INTERVAL_MS = 20000L;
+    private static final int MAX_AUTO_RECONNECTS = 3;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private String currentMac;
+    private int reconnectAttempts = 0;
+    private boolean userStopped = false;
+    private boolean reconnectScheduled = false;
 
     public static void start(Context ctx, String mac) {
         Intent intent = new Intent(ctx, AquaWatchForegroundService.class);
@@ -68,7 +79,7 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
         super.onCreate();
         app = (AquaWatchApp) getApplication();
         btManager = app.getBluetoothManager();
-        btManager.setListener(this);
+        btManager.addListener(this);
         alertManager = new AlertNotificationManager(this);
         createServiceChannel();
     }
@@ -77,11 +88,28 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_START.equals(intent.getAction())) {
             String mac = intent.getStringExtra(EXTRA_MAC);
-            startInForeground("Connecting to Arduino Bluetooth...");
+            currentMac = mac;
+            reconnectAttempts = 0;
+            userStopped = false;
             if (mac != null && !mac.isEmpty()) {
-                btManager.connect(mac);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                        && ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                    broadcastState("ERROR", "PERMISSION_DENIED: grant Nearby devices permission before starting monitoring.");
+                    stopSelf();
+                    return START_NOT_STICKY;
+                }
+                try {
+                    startInForeground("Connecting to Arduino Bluetooth...");
+                    btManager.connect(mac);
+                } catch (SecurityException e) {
+                    broadcastState("ERROR", "PERMISSION_DENIED: could not start connected-device foreground service: " + e.getMessage());
+                    stopSelf();
+                }
             }
         } else if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+            userStopped = true;
+            reconnectScheduled = false;
+            mainHandler.removeCallbacksAndMessages(null);
             btManager.disconnect();
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
@@ -101,10 +129,15 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
                 .setOngoing(true)
                 .build();
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
-        } else {
-            startForeground(NOTIF_ID, notification);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+            } else {
+                startForeground(NOTIF_ID, notification);
+            }
+        } catch (SecurityException e) {
+            broadcastState("ERROR", "PERMISSION_DENIED: foreground service could not start. Grant Nearby devices permission first. " + e.getMessage());
+            throw e;
         }
     }
 
@@ -123,7 +156,27 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
 
     @Override
     public void onConnectionStateChanged(String state, String details) {
-        updateNotification(state + ": " + details);
+        mainHandler.post(() -> {
+            updateNotification(state + ": " + details);
+            broadcastState(state, details);
+            if ("CONNECTED".equals(state)) {
+                reconnectAttempts = 0;
+                reconnectScheduled = false;
+            } else if ("DISCONNECTED".equals(state) && !userStopped && currentMac != null
+                    && reconnectAttempts < MAX_AUTO_RECONNECTS && !reconnectScheduled) {
+                reconnectAttempts++;
+                reconnectScheduled = true;
+                long delay = 1000L * reconnectAttempts;
+                broadcastState("RECONNECTING", "Connection dropped; retry " + reconnectAttempts + " of " + MAX_AUTO_RECONNECTS + " in " + delay + " ms.");
+                mainHandler.postDelayed(() -> {
+                    reconnectScheduled = false;
+                    if (!userStopped && currentMac != null) btManager.connect(currentMac);
+                }, delay);
+            }
+        });
+    }
+
+    private void broadcastState(String state, String details) {
         Intent broadcast = new Intent("com.aquawatch.STATE_UPDATE");
         broadcast.putExtra("state", state);
         broadcast.putExtra("details", details);
@@ -198,6 +251,9 @@ public class AquaWatchForegroundService extends Service implements BluetoothClas
 
     @Override
     public void onDestroy() {
+        userStopped = true;
+        mainHandler.removeCallbacksAndMessages(null);
+        if (btManager != null) btManager.removeListener(this);
         dbExecutor.shutdown();
         super.onDestroy();
     }
